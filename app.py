@@ -218,12 +218,14 @@ def api_login():
     password = data.get("password", "").strip()
     
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD_RAW:
+        session.clear()
         session['username'] = username
         session.permanent = True
         return jsonify({"success": True, "redirect": "/admin", "is_admin": True})
     
     user = db["users"].get(username)
     if user and user["password"] == hashlib.sha256(password.encode()).hexdigest():
+        session.clear()
         session['username'] = username
         session.permanent = True
         user["last_login"] = str(datetime.now())
@@ -236,8 +238,10 @@ def api_login():
 def api_logout():
     """تسجيل الخروج - مسح الجلسة بالكامل"""
     session.clear()
-    response = make_response(jsonify({"success": True}))
+    response = make_response(jsonify({"success": True, "message": "تم تسجيل الخروج بنجاح"}))
     response.delete_cookie('session')
+    # حذف أي كوكيز أخرى
+    response.set_cookie('remember_token', '', expires=0)
     return response
 
 @app.route('/api/current_user')
@@ -498,7 +502,7 @@ def get_server_stats(folder):
         "ip": get_public_ip()
     })
 
-# ============== API - الملفات ==============
+# ============== API - الملفات (مُصلح بالكامل) ==============
 
 @app.route('/api/files/list/<folder>')
 def list_server_files(folder):
@@ -512,6 +516,8 @@ def list_server_files(folder):
     files = []
     try:
         for f in os.listdir(path):
+            if f in ["out.log", "meta.json"]:
+                continue
             fpath = os.path.join(path, f)
             stat = os.stat(fpath)
             size_bytes = stat.st_size
@@ -593,7 +599,7 @@ def create_file(folder):
 
 @app.route('/api/files/delete/<folder>', methods=['POST'])
 def delete_files(folder):
-    """حذف ملفات - نسخة محسنة"""
+    """حذف ملفات - نسخة محسنة بالكامل مع دعم الملفات والمجلدات"""
     if "username" not in session:
         return jsonify({"success": False, "message": "غير مصرح"}), 401
     
@@ -603,17 +609,33 @@ def delete_files(folder):
     
     data = request.get_json() or {}
     names = data.get("names", data.get("name", []))
+    
+    # إذا كان names نصاً عادياً
     if isinstance(names, str):
         names = [names]
     
-    if not names:
-        return jsonify({"success": False, "message": "لم يتم تحديد ملفات"})
+    if not names or len(names) == 0:
+        return jsonify({"success": False, "message": "لم يتم تحديد ملفات للحذف"})
     
     deleted = 0
+    errors = []
+    
     for name in names:
-        if not name or '..' in name:
+        if not name or name in ['out.log', 'meta.json']:
             continue
+            
+        # منع اختراق المسار
+        if '..' in name or name.startswith('/') or name.startswith('\\'):
+            errors.append(f"{name}: اسم غير صالح")
+            continue
+            
         fpath = os.path.join(srv["path"], name)
+        
+        # التأكد من أن المسار داخل مجلد السيرفر
+        if not os.path.abspath(fpath).startswith(os.path.abspath(srv["path"])):
+            errors.append(f"{name}: مسار غير مصرح")
+            continue
+        
         try:
             if os.path.isdir(fpath):
                 shutil.rmtree(fpath)
@@ -621,13 +643,15 @@ def delete_files(folder):
             elif os.path.exists(fpath):
                 os.remove(fpath)
                 deleted += 1
+            else:
+                errors.append(f"{name}: غير موجود")
         except Exception as e:
-            print(f"خطأ في حذف {name}: {e}")
+            errors.append(f"{name}: {str(e)}")
     
     if deleted > 0:
-        return jsonify({"success": True, "message": f"🗑️ تم حذف {deleted} ملف"})
+        return jsonify({"success": True, "message": f"🗑️ تم حذف {deleted} ملف/مجلد", "errors": errors if errors else None})
     else:
-        return jsonify({"success": False, "message": "فشل حذف الملفات"})
+        return jsonify({"success": False, "message": "فشل حذف الملفات", "errors": errors})
 
 @app.route('/api/files/rename/<folder>', methods=['POST'])
 def rename_file(folder):
@@ -642,8 +666,16 @@ def rename_file(folder):
     new_name = data.get("new_name", "").strip()
     if not old_name or not new_name or '..' in old_name or '..' in new_name:
         return jsonify({"success": False, "message": "اسم غير صالح"})
+    
+    if old_name in ['out.log', 'meta.json']:
+        return jsonify({"success": False, "message": "لا يمكن إعادة تسمية هذا الملف"})
+        
     old_path = os.path.join(srv["path"], old_name)
     new_path = os.path.join(srv["path"], new_name)
+    
+    if not os.path.exists(old_path):
+        return jsonify({"success": False, "message": "الملف غير موجود"})
+        
     try:
         os.rename(old_path, new_path)
         return jsonify({"success": True, "message": f"✅ تم التغيير إلى {new_name}"})
@@ -666,30 +698,42 @@ def upload_files(folder):
         return jsonify({"success": False, "message": "لا توجد ملفات"})
     
     uploaded = 0
+    errors = []
+    
     for f in files:
         try:
             if not f or not f.filename:
                 continue
             if '..' in f.filename:
+                errors.append(f"{f.filename}: اسم غير صالح")
                 continue
+                
             save_path = os.path.join(srv["path"], f.filename)
+            
+            # منع استبدال ملفات النظام
+            if f.filename in ['out.log', 'meta.json']:
+                errors.append(f"{f.filename}: لا يمكن استبدال هذا الملف")
+                continue
+                
             f.save(save_path)
             
+            # فك ضغط ZIP تلقائياً
             if f.filename.lower().endswith('.zip'):
                 try:
                     with zipfile.ZipFile(save_path, 'r') as z:
                         z.extractall(srv["path"])
                     os.remove(save_path)
-                except:
-                    pass
+                except Exception as zip_err:
+                    errors.append(f"{f.filename}: فشل فك الضغط - {str(zip_err)}")
+                    
             uploaded += 1
-        except:
-            pass
+        except Exception as e:
+            errors.append(f"{f.filename}: {str(e)}")
     
     if uploaded > 0:
-        return jsonify({"success": True, "message": f"✅ تم رفع {uploaded} ملف"})
+        return jsonify({"success": True, "message": f"✅ تم رفع {uploaded} ملف", "errors": errors if errors else None})
     else:
-        return jsonify({"success": False, "message": "فشل الرفع"})
+        return jsonify({"success": False, "message": "فشل رفع الملفات", "errors": errors})
 
 @app.route('/api/server/install/<folder>', methods=['POST'])
 def install_requirements(folder):
