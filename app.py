@@ -15,48 +15,14 @@ import zipfile
 from datetime import datetime, timedelta
 from flask import Flask, send_from_directory, request, jsonify, session, redirect, url_for, make_response
 
-# ============== AUTO INSTALL ALL PACKAGES ==============
-def auto_install_all_packages():
-    """تثبيت تلقائي لجميع المكتبات المطلوبة عند بدء التشغيل"""
-    required_packages = [
-        'fpdf', 'Pillow', 'cryptography', 'reportlab', 
-        'openpyxl', 'pandas', 'numpy', 'matplotlib',
-        'beautifulsoup4', 'selenium', 'aiohttp', 'redis',
-        'celery', 'sqlalchemy', 'PyPDF2', 'python-docx',
-        'xlrd', 'xlwt', 'tqdm', 'colorama', 'pyyaml'
-    ]
-    
-    print("\n" + "="*60)
-    print("📦 OMAR BRO HOST - Auto Installing All Packages")
-    print("="*60)
-    
-    for package in required_packages:
-        try:
-            pkg_import = package.replace('-', '_')
-            __import__(pkg_import)
-            print(f"✅ {package} مثبت مسبقاً")
-        except ImportError:
-            print(f"📦 جاري تثبيت {package}...")
-            try:
-                subprocess.check_call([
-                    sys.executable, "-m", "pip", "install", package,
-                    "--no-cache-dir", "--quiet"
-                ])
-                print(f"✅ تم تثبيت {package}")
-            except Exception as e:
-                print(f"⚠️ فشل تثبيت {package}: {str(e)}")
-
-# تشغيل التثبيت التلقائي
-auto_install_all_packages()
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 USERS_DIR = os.path.join(BASE_DIR, "USERS")
 os.makedirs(USERS_DIR, exist_ok=True)
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=3650)  # 10 سنوات
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max upload
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
@@ -83,8 +49,8 @@ def load_db():
                 "password": admin_hash,
                 "is_admin": True,
                 "created_at": str(datetime.now()),
-                "max_servers": 999,  # ما لا نهاية
-                "expiry_days": 99999,  # صلاحية غير محدودة
+                "max_servers": 999999,  # غير محدود للمسؤول
+                "expiry_days": 3650,
                 "last_login": None
             }
         },
@@ -108,9 +74,10 @@ db = load_db()
 
 # ============== إدارة المنافذ ==============
 PORT_RANGE_START = 8100
-PORT_RANGE_END = 9000
+PORT_RANGE_END = 9100
 
 def get_assigned_port():
+    """الحصول على منفذ غير مستخدم"""
     used = set()
     for srv in db.get("servers", {}).values():
         if srv.get("port"):
@@ -129,57 +96,9 @@ def get_assigned_port():
                 return port
     return PORT_RANGE_START
 
-# ============== نظام Keep-Alive المتقدم ==============
-def keep_alive_ping():
-    """نظام Keep-Alive - يمنع الموقع من النوم"""
-    own_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5000")
-    while True:
-        try:
-            time.sleep(300)  # كل 5 دقائق
-            requests.get(f"{own_url}/api/ping", timeout=10)
-            print(f"[{datetime.now()}] ✅ Keep-Alive Ping sent")
-        except Exception as e:
-            print(f"[{datetime.now()}] ⚠️ Keep-Alive error: {e}")
-
-def auto_restart_watchdog():
-    """مراقب السيرفرات - يعيد تشغيل المتوقفة تلقائياً"""
-    while True:
-        time.sleep(60)  # كل دقيقة
-        try:
-            for folder, srv in db["servers"].items():
-                # إذا كان السيرفر مفعل لكنه متوقف، أعده للتشغيل
-                if srv.get("auto_restart", True) and srv.get("status") == "Stopped":
-                    print(f"[{datetime.now()}] 🔄 إعادة تشغيل تلقائي للسيرفر: {srv['name']}")
-                    # محاولة إعادة التشغيل
-                    if srv.get("startup_file"):
-                        try:
-                            port = srv.get("port", get_assigned_port())
-                            log_path = os.path.join(srv["path"], "out.log")
-                            log_file = open(log_path, "a", encoding='utf-8')
-                            log_file.write(f"\n{'='*50}\n🔄 إعادة تشغيل تلقائي - {datetime.now()}\n{'='*50}\n")
-                            proc = subprocess.Popen(
-                                [sys.executable, "-u", srv["startup_file"]],
-                                cwd=srv["path"],
-                                stdout=log_file,
-                                stderr=subprocess.STDOUT,
-                                env={**os.environ, "PORT": str(port)}
-                            )
-                            srv["status"] = "Running"
-                            srv["pid"] = proc.pid
-                            srv["start_time"] = time.time()
-                            save_db(db)
-                            print(f"[{datetime.now()}] ✅ تم إعادة تشغيل السيرفر: {srv['name']}")
-                        except Exception as e:
-                            print(f"[{datetime.now()}] ❌ فشل إعادة تشغيل {srv['name']}: {e}")
-        except Exception as e:
-            print(f"[{datetime.now()}] ⚠️ Watchdog error: {e}")
-
-# تشغيل الـ Keep-Alive في خيط منفصل
-threading.Thread(target=keep_alive_ping, daemon=True).start()
-threading.Thread(target=auto_restart_watchdog, daemon=True).start()
-
-# ============== مراقبة العمليات ==============
-def monitor_processes():
+# ============== مراقبة العمليات المستمرة ==============
+def process_monitor():
+    """مراقبة العمليات وإعادة تشغيل المتوقفة تلقائياً"""
     while True:
         try:
             for folder, srv in list(db["servers"].items()):
@@ -187,19 +106,97 @@ def monitor_processes():
                     try:
                         p = psutil.Process(srv["pid"])
                         if not p.is_running() or p.status() == psutil.STATUS_ZOMBIE:
-                            db["servers"][folder]["status"] = "Stopped"
-                            db["servers"][folder]["pid"] = None
-                            save_db(db)
-                            print(f"[{datetime.now()}] ⚠️ السيرفر {srv['name']} توقف، سيتم إعادة تشغيله قريباً")
-                    except:
-                        db["servers"][folder]["status"] = "Stopped"
-                        db["servers"][folder]["pid"] = None
-                        save_db(db)
+                            # العملية توقفت - محاولة إعادة التشغيل التلقائي
+                            print(f"🔄 العملية {folder} توقفت، جاري إعادة التشغيل...")
+                            restart_server(folder)
+                    except psutil.NoSuchProcess:
+                        print(f"🔄 العملية {folder} غير موجودة، جاري إعادة التشغيل...")
+                        restart_server(folder)
+                    except Exception as e:
+                        print(f"⚠️ خطأ في مراقبة {folder}: {e}")
+        except Exception as e:
+            print(f"❌ خطأ في المراقبة: {e}")
+        time.sleep(15)  # فحص كل 15 ثانية
+
+def restart_server(folder):
+    """إعادة تشغيل سيرفر متوقف"""
+    srv = db["servers"].get(folder)
+    if not srv:
+        return
+    
+    # تنظيف العملية القديمة
+    if srv.get("pid"):
+        try:
+            p = psutil.Process(srv["pid"])
+            for child in p.children(recursive=True):
+                child.kill()
+            p.kill()
         except:
             pass
-        time.sleep(30)
+    
+    srv["status"] = "Stopped"
+    srv["pid"] = None
+    save_db(db)
+    time.sleep(1)
+    
+    # محاولة التشغيل مرة أخرى
+    start_server_process(folder)
 
-threading.Thread(target=monitor_processes, daemon=True).start()
+def start_server_process(folder):
+    """تشغيل عملية السيرفر"""
+    srv = db["servers"].get(folder)
+    if not srv:
+        return False
+    
+    main_file = srv.get("startup_file", "")
+    
+    # البحث عن ملف تشغيل إذا لم يتم تحديده
+    if not main_file:
+        for f in ["main.py", "app.py", "bot.py", "index.py", "server.py", "run.py"]:
+            if os.path.exists(os.path.join(srv["path"], f)):
+                main_file = f
+                srv["startup_file"] = f
+                save_db(db)
+                break
+    
+    if not main_file:
+        return False
+    
+    file_path = os.path.join(srv["path"], main_file)
+    if not os.path.exists(file_path):
+        return False
+    
+    port = srv.get("port")
+    if not port:
+        port = get_assigned_port()
+        srv["port"] = port
+        save_db(db)
+    
+    log_path = os.path.join(srv["path"], "out.log")
+    log_file = open(log_path, "a", encoding='utf-8')
+    log_file.write(f"\n{'='*50}\n🚀 بدء التشغيل - {datetime.now()}\n📁 {main_file}\n🔌 المنفذ: {port}\n{'='*50}\n\n")
+    log_file.flush()
+    
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-u", main_file],
+            cwd=srv["path"],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PORT": str(port)}
+        )
+        srv["status"] = "Running"
+        srv["pid"] = proc.pid
+        srv["start_time"] = time.time()
+        save_db(db)
+        return True
+    except Exception as e:
+        log_file.write(f"\n❌ خطأ في التشغيل: {str(e)}\n")
+        log_file.close()
+        return False
+
+# بدء مراقب العمليات
+threading.Thread(target=process_monitor, daemon=True).start()
 
 def get_current_user():
     if "username" in session:
@@ -285,8 +282,8 @@ def api_register():
         "password": hashlib.sha256(password.encode()).hexdigest(),
         "is_admin": False,
         "created_at": str(datetime.now()),
-        "max_servers": 999,  # غير محدود
-        "expiry_days": 99999,  # صلاحية غير محدودة
+        "max_servers": 999999,  # غير محدود للمستخدمين العاديين أيضاً
+        "expiry_days": 365,
         "last_login": None
     }
     save_db(db)
@@ -322,22 +319,10 @@ def api_login():
 
 @app.route('/api/logout', methods=['GET', 'POST'])
 def api_logout():
-    """تسجيل الخروج - مسح الجلسة بالكامل مع حذف الكوكيز"""
-    print("🔄 جاري تسجيل الخروج...")
-    
     session.clear()
-    
-    response = make_response(jsonify({
-        "success": True, 
-        "message": "تم تسجيل الخروج بنجاح"
-    }))
-    
+    response = make_response(jsonify({"success": True, "message": "تم تسجيل الخروج بنجاح"}))
     response.set_cookie('session', '', expires=0, path='/')
     response.set_cookie('remember_token', '', expires=0, path='/')
-    response.delete_cookie('session', path='/')
-    response.delete_cookie('remember_token', path='/')
-    
-    print("✅ تم تسجيل الخروج وحذف الكوكيز")
     return response
 
 @app.route('/api/current_user')
@@ -352,7 +337,7 @@ def api_current_user():
             })
     return jsonify({"success": False})
 
-# ============== API - السيرفرات ==============
+# ============== API - السيرفرات (غير محدودة) ==============
 
 @app.route('/api/servers')
 def list_servers():
@@ -384,8 +369,8 @@ def list_servers():
                 "port": srv.get("port", "N/A")
             })
     
-    user = db["users"].get(session["username"], {"max_servers": 999, "expiry_days": 99999})
-    max_srv = user.get("max_servers", 999)
+    user = db["users"].get(session["username"], {"max_servers": 999999, "expiry_days": 365})
+    max_srv = user.get("max_servers", 999999)
     
     return jsonify({
         "success": True,
@@ -393,7 +378,7 @@ def list_servers():
         "stats": {
             "used": len(user_servers),
             "total": max_srv,
-            "expiry": "غير محدود"  # بدلاً من عدد الأيام
+            "expiry": user.get("expiry_days", 365)
         }
     })
 
@@ -402,10 +387,13 @@ def add_server():
     if "username" not in session:
         return jsonify({"success": False}), 401
     
-    user = db["users"].get(session["username"], {"max_servers": 999})
+    user = db["users"].get(session["username"], {"max_servers": 999999})
     user_srv_count = len([s for s in db["servers"].values() if s["owner"] == session["username"]])
-    if user_srv_count >= user.get("max_servers", 999):
-        return jsonify({"success": False, "message": "وصلت للحد الأقصى من السيرفرات"})
+    
+    # لا يوجد حد أقصى - سيرفرات غير محدودة
+    if user_srv_count >= user.get("max_servers", 999999):
+        # حتى لو وصل للحد، نسمح له بزيادة (لأن الرقم كبير جداً)
+        pass
     
     data = request.get_json()
     name = data.get("name", "New Server").strip()
@@ -427,11 +415,10 @@ def add_server():
         "created_at": str(datetime.now()),
         "startup_file": "",
         "pid": None,
-        "port": assigned_port,
-        "auto_restart": True  # إعادة تشغيل تلقائي
+        "port": assigned_port
     }
     save_db(db)
-    return jsonify({"success": True, "message": f"✅ تم إنشاء السيرفر"})
+    return jsonify({"success": True, "message": f"✅ تم إنشاء السيرفر {name}"})
 
 @app.route('/api/server/action/<folder>/<action>', methods=['POST'])
 def server_action(folder, action):
@@ -446,47 +433,10 @@ def server_action(folder, action):
         if srv.get("status") == "Running":
             return jsonify({"success": False, "message": "السيرفر يعمل بالفعل"})
         
-        main_file = srv.get("startup_file", "")
-        
-        if not main_file:
-            for f in ["main.py", "app.py", "bot.py", "index.py"]:
-                if os.path.exists(os.path.join(srv["path"], f)):
-                    main_file = f
-                    srv["startup_file"] = f
-                    break
-        
-        if not main_file:
-            return jsonify({"success": False, "message": "لم يتم العثور على ملف تشغيل. الرجاء رفع ملف أولاً"})
-        
-        file_path = os.path.join(srv["path"], main_file)
-        if not os.path.exists(file_path):
-            return jsonify({"success": False, "message": f"الملف {main_file} غير موجود"})
-        
-        port = srv.get("port")
-        if not port:
-            port = get_assigned_port()
-            srv["port"] = port
-        
-        log_path = os.path.join(srv["path"], "out.log")
-        log_file = open(log_path, "a", encoding='utf-8')
-        log_file.write(f"\n{'='*50}\n🚀 بدء التشغيل - {datetime.now()}\n📁 {main_file}\n🔌 المنفذ: {port}\n{'='*50}\n\n")
-        log_file.flush()
-        
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, "-u", main_file],
-                cwd=srv["path"],
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, "PORT": str(port)}
-            )
-            srv["status"] = "Running"
-            srv["pid"] = proc.pid
-            srv["start_time"] = time.time()
-            save_db(db)
+        if start_server_process(folder):
             return jsonify({"success": True, "message": "✅ تم تشغيل السيرفر"})
-        except Exception as e:
-            return jsonify({"success": False, "message": str(e)})
+        else:
+            return jsonify({"success": False, "message": "فشل التشغيل - تأكد من وجود ملف تشغيل (main.py أو app.py)"})
 
     elif action == "stop":
         if srv.get("pid"):
@@ -503,6 +453,7 @@ def server_action(folder, action):
         return jsonify({"success": True, "message": "🛑 تم إيقاف السيرفر"})
 
     elif action == "restart":
+        # إيقاف
         if srv.get("pid"):
             try:
                 p = psutil.Process(srv["pid"])
@@ -515,7 +466,11 @@ def server_action(folder, action):
         srv["pid"] = None
         save_db(db)
         time.sleep(1)
-        return server_action(folder, "start")
+        # تشغيل
+        if start_server_process(folder):
+            return jsonify({"success": True, "message": "✅ تم إعادة تشغيل السيرفر"})
+        else:
+            return jsonify({"success": False, "message": "فشل إعادة التشغيل"})
 
     elif action == "delete":
         if srv.get("pid"):
@@ -530,7 +485,6 @@ def server_action(folder, action):
         if os.path.exists(srv["path"]):
             try:
                 shutil.rmtree(srv["path"])
-                print(f"✅ تم حذف مجلد السيرفر: {srv['path']}")
             except:
                 try:
                     subprocess.run(["rm", "-rf", srv["path"]], timeout=5)
@@ -539,7 +493,7 @@ def server_action(folder, action):
         
         del db["servers"][folder]
         save_db(db)
-        return jsonify({"success": True, "message": "🗑️ تم حذف السيرفر بنجاح"})
+        return jsonify({"success": True, "message": "🗑️ تم حذف السيرفر"})
 
     return jsonify({"success": False})
 
@@ -547,7 +501,10 @@ def get_public_ip():
     try:
         return requests.get('https://api.ipify.org', timeout=3).text
     except:
-        return "127.0.0.1"
+        try:
+            return requests.get('https://icanhazip.com', timeout=3).text.strip()
+        except:
+            return "127.0.0.1"
 
 @app.route('/api/server/stats/<folder>')
 def get_server_stats(folder):
@@ -698,7 +655,6 @@ def create_file(folder):
 
 @app.route('/api/files/delete/<folder>', methods=['POST'])
 def delete_files(folder):
-    """حذف ملفات - مع حذف فوري"""
     if "username" not in session:
         return jsonify({"success": False, "message": "غير مصرح"}), 401
     
@@ -725,11 +681,9 @@ def delete_files(folder):
             if os.path.isdir(fpath):
                 shutil.rmtree(fpath)
                 deleted += 1
-                print(f"✅ تم حذف المجلد: {fpath}")
             elif os.path.exists(fpath):
                 os.remove(fpath)
                 deleted += 1
-                print(f"✅ تم حذف الملف: {fpath}")
             else:
                 failed.append(name)
         except Exception as e:
@@ -790,6 +744,7 @@ def upload_files(folder):
             save_path = os.path.join(srv["path"], f.filename)
             f.save(save_path)
             
+            # فك ضغط ZIP تلقائياً
             if f.filename.lower().endswith('.zip'):
                 try:
                     with zipfile.ZipFile(save_path, 'r') as z:
@@ -805,6 +760,27 @@ def upload_files(folder):
         return jsonify({"success": True, "message": f"✅ تم رفع {uploaded} ملف"})
     else:
         return jsonify({"success": False, "message": "فشل الرفع"})
+
+@app.route('/api/server/set-startup/<folder>', methods=['POST'])
+def set_startup_file(folder):
+    if "username" not in session:
+        return jsonify({"success": False}), 401
+    srv = db["servers"].get(folder)
+    if not srv or srv["owner"] != session["username"]:
+        return jsonify({"success": False})
+    
+    data = request.get_json()
+    filename = data.get("filename", "").strip()
+    if not filename or '..' in filename:
+        return jsonify({"success": False, "message": "اسم غير صالح"})
+    
+    file_path = os.path.join(srv["path"], filename)
+    if not os.path.exists(file_path):
+        return jsonify({"success": False, "message": "الملف غير موجود"})
+    
+    srv["startup_file"] = filename
+    save_db(db)
+    return jsonify({"success": True, "message": f"✅ تم تعيين {filename} كملف التشغيل"})
 
 @app.route('/api/server/install/<folder>', methods=['POST'])
 def install_requirements(folder):
@@ -837,7 +813,7 @@ def install_requirements(folder):
                         log_file.write(f"\n❌ فشل التثبيت\n")
             
             threading.Thread(target=wait_install, daemon=True).start()
-            return jsonify({"success": True, "message": "📦 بدأ التثبيت"})
+            return jsonify({"success": True, "message": "📦 بدأ تثبيت المكتبات"})
         except Exception as e:
             return jsonify({"success": False, "message": str(e)})
     return jsonify({"success": False, "message": "requirements.txt غير موجود"})
@@ -856,8 +832,8 @@ def admin_users():
             "is_admin": udata.get("is_admin", False),
             "created_at": udata.get("created_at"),
             "last_login": udata.get("last_login"),
-            "max_servers": udata.get("max_servers", 999),
-            "expiry_days": "غير محدود" if udata.get("expiry_days", 99999) > 9999 else udata.get("expiry_days", 30)
+            "max_servers": udata.get("max_servers", 999999),
+            "expiry_days": udata.get("expiry_days", 365)
         })
     return jsonify({"success": True, "users": users_list})
 
@@ -869,8 +845,8 @@ def admin_create_user():
     data = request.get_json()
     username = data.get("username", "").strip()
     password = data.get("password", "").strip()
-    max_servers = int(data.get("max_servers", 999))
-    expiry_days = int(data.get("expiry_days", 99999))
+    max_servers = int(data.get("max_servers", 999999))
+    expiry_days = int(data.get("expiry_days", 365))
     
     if not username or not password:
         return jsonify({"success": False, "message": "جميع الحقول مطلوبة"})
@@ -947,58 +923,9 @@ def get_metrics():
 
 @app.route('/api/ping', methods=['GET', 'POST'])
 def ping():
-    """نقطة نهاية Keep-Alive - تمنع الموقع من النوم"""
-    return jsonify({
-        "status": "alive", 
-        "timestamp": str(datetime.now()),
-        "uptime": "running 24/7"
-    })
-
-# ============== API - تثبيت مكتبات إضافية ==============
-
-@app.route('/api/install-package', methods=['POST'])
-def install_package():
-    """تثبيت مكتبة بايثون جديدة"""
-    if "username" not in session or not is_admin(session["username"]):
-        return jsonify({"success": False, "message": "غير مصرح"}), 403
-    
-    data = request.get_json()
-    package_name = data.get("package", "").strip()
-    
-    if not package_name:
-        return jsonify({"success": False, "message": "الرجاء إدخال اسم المكتبة"})
-    
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", package_name],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        
-        if result.returncode == 0:
-            return jsonify({
-                "success": True, 
-                "message": f"✅ تم تثبيت {package_name} بنجاح",
-                "output": result.stdout
-            })
-        else:
-            return jsonify({
-                "success": False, 
-                "message": f"❌ فشل تثبيت {package_name}",
-                "error": result.stderr
-            })
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)})
+    return jsonify({"status": "pong", "timestamp": str(datetime.now())})
 
 # ============== تشغيل التطبيق ==============
 if __name__ == "__main__":
-    print("\n" + "="*60)
-    print("🚀 OMAR BRO HOST - Server Starting...")
-    print("="*60)
-    print(f"✅ تم تشغيل السيرفر على http://0.0.0.0:5000")
-    print(f"👑 حساب المسؤول: {ADMIN_USERNAME}")
-    print("🔄 نظام Keep-Alive يعمل - السيرفرات تعمل 24/7")
-    print("🔄 نظام إعادة التشغيل التلقائي مفعل")
-    print("="*60 + "\n")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
